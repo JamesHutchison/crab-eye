@@ -1,0 +1,111 @@
+Scratch notes
+
+Splitting a regex between directory and file:
+
+fn split_regex(regex_str: &str) -> (String, String) {
+    if let Some(idx) = regex_str.rfind('/') {
+        let (dir_part, file_part) = regex_str.split_at(idx);
+        (dir_part.to_string(), file_part[1..].to_string())
+    } else {
+        (".*".to_string(), regex_str.to_string())
+    }
+}
+
+
+
+
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::sync::mpsc::channel;
+use std::time::Duration;
+use structopt::StructOpt;
+use walkdir::{DirEntry, WalkDir};
+use regex::Regex;
+use notify::{watcher, RecursiveMode, Watcher, RawEvent};
+
+#[derive(Debug, StructOpt)]
+#[structopt(name = "directory-watcher", about = "A directory watcher.")]
+struct Opt {
+    /// Set roots
+    #[structopt(name = "DIRECTORY", parse(from_os_str))]
+    roots: Vec<PathBuf>,
+
+    /// Regular expression for matching directories
+    #[structopt(long = "include", default_value = ".*")]
+    include: String,
+
+    /// Regular expression for excluding directories
+    #[structopt(long = "exclude", default_value = "$.")]
+    exclude: String,
+
+    /// Polling frequency in milliseconds
+    #[structopt(long = "poll", default_value = "1000")]
+    poll: u64,
+}
+
+fn check_dir(path: &PathBuf, include_re: &Regex, exclude_re: &Regex) -> bool {
+    let path_str = path.to_string_lossy();
+    include_re.is_match(&path_str) && !exclude_re.is_match(&path_str)
+}
+
+fn watch_directory(path: &PathBuf, watcher: &mut Watcher, watcher_buffer: &mut VecDeque<PathBuf>) {
+    if watcher_buffer.len() == 100 {
+        if let Some(oldest_path) = watcher_buffer.pop_front() {
+            if watcher.unwatch(&oldest_path).is_ok() {
+                println!("Stopped watching: {}", oldest_path.to_string_lossy());
+            }
+        }
+    }
+
+    if watcher.watch(&path, RecursiveMode::NonRecursive).is_ok() {
+        println!("Started watching: {}", path.to_string_lossy());
+        watcher_buffer.push_back(path.clone());
+    }
+}
+
+fn process_directory(path: &PathBuf, include_re: &Regex, exclude_re: &Regex, watcher: &mut Watcher, watcher_buffer: &mut VecDeque<PathBuf>) {
+    if path.is_dir() && check_dir(&path, &include_re, &exclude_re) {
+        for entry in WalkDir::new(path).min_depth(1).max_depth(1) {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_dir() {
+                process_directory(&PathBuf::from(path), &include_re, &exclude_re, watcher, watcher_buffer);
+            } else {
+                watch_directory(&PathBuf::from(path), watcher, watcher_buffer);
+            }
+        }
+    }
+}
+
+fn main() {
+    let opt = Opt::from_args();
+
+    let include_re = Regex::new(&opt.include).unwrap();
+    let exclude_re = Regex::new(&opt.exclude).unwrap();
+
+    let (tx, rx) = channel();
+    let mut watcher = watcher(tx, Duration::from_millis(opt.poll)).unwrap();
+    let mut watcher_buffer: VecDeque<PathBuf> = VecDeque::with_capacity(100);
+
+    for root in opt.roots {
+        process_directory(&root, &include_re, &exclude_re, &mut watcher, &mut watcher_buffer);
+    }
+
+    loop {
+        match rx.recv() {
+            Ok(RawEvent{path: Some(path), op: Ok(op), cookie: _ }) => {
+                println!("{}: {:?}", path.to_string_lossy(), op);
+                if op.contains(notify::op::REMOVE) || op.contains(notify::op::RENAME) {
+                    if let Some(pos) = watcher_buffer.iter().position(|x| *x == path) {
+                        watcher_buffer.remove(pos);
+                    }
+                }
+            },
+            Ok(event) => println!("Broken event: {:?}", event),
+            Err(e) => println!("Watch error: {:?}", e),
+        }
+    }
+}
+
+
+
